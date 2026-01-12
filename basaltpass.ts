@@ -57,7 +57,6 @@ export type AuthCallback = (result: AuthResult) => void;
 export class BasaltPass {
   private config: BasaltPassConfig;
   private accessToken?: string;
-  private refreshToken?: string;
   private userInfo?: UserInfo;
   private silentRenewTimer?: number;
   private onAuthCallback?: AuthCallback;
@@ -297,13 +296,14 @@ export class BasaltPass {
    */
   public logout(): void {
     this.accessToken = undefined;
-    this.refreshToken = undefined;
     this.userInfo = undefined;
     
     localStorage.removeItem('basaltpass_access_token');
-    localStorage.removeItem('basaltpass_refresh_token');
     localStorage.removeItem('basaltpass_user_info');
     
+    // 调用后端注销接口以清除Cookie（可选）
+    // fetch('/auth/logout', { method: 'POST' });
+
     this.stopSilentRenew();
     this.notifyAuth({ success: false });
   }
@@ -331,29 +331,40 @@ export class BasaltPass {
 
   /**
    * 刷新令牌
+   * 使用 HttpOnly Cookie 进行刷新，不依赖 localStorage 中的 refresh_token
    */
   public async refreshAccessToken(): Promise<boolean> {
-    if (!this.refreshToken) {
-      return false;
-    }
-
     try {
-      const response = await fetch(this.config.tokenEndpoint || '/oauth/token', {
+      // 优先使用专门的 Refresh Endpoint，通常是 /auth/refresh，支持通过 Cookie 验证
+      // 如果配置了 tokenEndpoint (如 /oauth/token)，则尝试使用它，但依然依赖 Cookie 而非 Body 参数
+      const endpoint = '/auth/refresh'; 
+
+      const response = await fetch(endpoint, {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
+          'Accept': 'application/json'
         },
-        body: new URLSearchParams({
-          grant_type: 'refresh_token',
-          refresh_token: this.refreshToken,
-          client_id: this.config.clientId
-        })
+        credentials: 'include' // 关键：发送 Cookie
       });
 
       if (response.ok) {
-        const tokenData: TokenResponse = await response.json();
-        await this.handleTokenResponse(tokenData);
-        return true;
+        // Refresh 接口通常只返回新的 access_token (和潜在的新 refresh cookie)
+        // 或者是标准的 TokenResponse
+        const data = await response.json();
+        
+        // 兼容处理：data可能是 { access_token: "..." } 或 TokenResponse
+        const newAccessToken = data.access_token;
+        
+        if (newAccessToken) {
+          // 更新 access_token
+          this.accessToken = newAccessToken;
+          localStorage.setItem('basaltpass_access_token', this.accessToken!);
+          
+          // 加载最新的用户信息
+          await this.loadUserInfo();
+          
+          return true;
+        }
       }
     } catch (error) {
       console.error('Token refresh failed:', error);
@@ -429,12 +440,12 @@ export class BasaltPass {
    */
   private async handleTokenResponse(tokenData: TokenResponse): Promise<void> {
     this.accessToken = tokenData.access_token;
-    this.refreshToken = tokenData.refresh_token;
+    // 安全修复：不要在 localStorage 中存储 refresh_token
+    // this.refreshToken = tokenData.refresh_token; 
+    // 后端应通过 Set-Cookie 头设置 refresh_token HttpOnly Cookie
     
     localStorage.setItem('basaltpass_access_token', this.accessToken);
-    if (this.refreshToken) {
-      localStorage.setItem('basaltpass_refresh_token', this.refreshToken);
-    }
+    // localStorage.removeItem('basaltpass_refresh_token'); // 确保清除旧的
 
     await this.loadUserInfo();
     
@@ -445,6 +456,7 @@ export class BasaltPass {
 
   /**
    * 加载用户信息
+   * 增强：当 Access Token 过期 (401) 时自动尝试刷新
    */
   private async loadUserInfo(): Promise<void> {
     if (!this.accessToken) return;
@@ -459,8 +471,16 @@ export class BasaltPass {
       if (response.ok) {
         this.userInfo = await response.json();
         localStorage.setItem('basaltpass_user_info', JSON.stringify(this.userInfo));
+      } else if (response.status === 401) {
+        // 令牌可能已过期，尝试使用 Cookie 刷新
+        console.log('Access token expired, attempting silent refresh...');
+        const refreshed = await this.refreshAccessToken();
+        if (!refreshed) {
+          this.logout();
+        }
+        // 如果刷新成功，refreshAccessToken 会递归调用 loadUserInfo 并成功，这里不需要额外操作
       } else {
-        // 令牌可能已过期
+        // 其他错误，注销
         this.logout();
       }
     } catch (error) {
