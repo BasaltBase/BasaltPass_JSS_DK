@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/brand/basaltpass-js-sdk-logo.svg" alt="BasaltPass JavaScript SDK" width="420" />
+</p>
+
 # BasaltPass JavaScript SDK
 
 TypeScript/JavaScript SDK for BasaltPass.
