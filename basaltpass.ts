@@ -1,578 +1,288 @@
-/**
- * BasaltPass JavaScript SDK
- * OAuth2/OIDC 客户端库，支持 One-Tap Auth 和 Silent Auth
- * 
- * TODO ⬇️ 实现完整的SDK功能
- */
-
 export interface BasaltPassConfig {
-  /** 客户端ID */
+  baseUrl?: string;
   clientId: string;
-  /** 重定向URI */
-  redirectUri?: string;
-  /** 授权服务器URL */
-  authorizationEndpoint?: string;
-  /** 令牌端点URL */
-  tokenEndpoint?: string;
-  /** 用户信息端点URL */
-  userInfoEndpoint?: string;
-  /** 权限范围 */
+  clientSecret: string;
+  defaultHeaders?: Record<string, string>;
+  fetchImpl?: typeof fetch;
+}
+
+export interface ApiErrorBody {
+  code?: string;
+  message?: string;
+}
+
+export class BasaltPassApiError extends Error {
+  public readonly status?: number;
+  public readonly code?: string;
+  public readonly requestId?: string;
+
+  constructor(message: string, options: { status?: number; code?: string; requestId?: string } = {}) {
+    super(message);
+    this.name = 'BasaltPassApiError';
+    this.status = options.status;
+    this.code = options.code;
+    this.requestId = options.requestId;
+  }
+}
+
+interface Envelope<T> {
+  data: T;
+  error: ApiErrorBody | null;
+  request_id?: string;
+}
+
+export interface ClientContext {
+  client_id: string;
+  app_id?: number;
+  tenant_id?: number;
   scopes?: string[];
-  /** 是否启用PKCE */
-  usePKCE?: boolean;
-  /** 是否启用静默刷新 */
-  enableSilentRenew?: boolean;
-  /** 静默刷新间隔（秒） */
-  silentRenewInterval?: number;
 }
 
-export interface UserInfo {
-  sub: string;
+export interface S2SUser {
+  id: number;
+  user_uuid?: string;
   email?: string;
-  email_verified?: boolean;
-  name?: string;
   nickname?: string;
-  picture?: string;
-  preferred_username?: string;
+  avatar_url?: string;
+  email_verified?: boolean;
+  phone?: string;
+  phone_verified?: boolean;
+  created_at?: string;
+  updated_at?: string;
 }
 
-export interface TokenResponse {
-  access_token: string;
-  token_type: string;
-  expires_in: number;
-  refresh_token?: string;
-  scope?: string;
-  id_token?: string;
+export interface S2SRole {
+  id: number;
+  code: string;
+  name?: string;
+  description?: string;
 }
 
-export interface AuthResult {
-  success: boolean;
-  user?: UserInfo;
-  accessToken?: string;
-  error?: string;
+export interface RoleCodes {
+  permission_codes?: string[];
+  role_codes?: string[];
+  roles?: string[];
 }
 
-export type AuthCallback = (result: AuthResult) => void;
+export interface S2STeam {
+  id: number;
+  name: string;
+  description?: string;
+  avatar_url?: string;
+  owner_user_id?: number;
+  members?: Array<Record<string, unknown>>;
+  created_at?: string;
+  updated_at?: string;
+}
 
-export class BasaltPass {
-  private config: BasaltPassConfig;
-  private accessToken?: string;
-  private userInfo?: UserInfo;
-  private silentRenewTimer?: number;
-  private onAuthCallback?: AuthCallback;
+export interface CreateTeamRequest {
+  name: string;
+  description?: string;
+  avatar_url?: string;
+  owner_user_id?: number;
+  member_user_ids?: number[];
+}
+
+export interface S2SUserWallet {
+  currency: string;
+  balance: number;
+  wallet_id: number;
+  transactions: Array<Record<string, unknown>>;
+}
+
+export interface S2SWalletAdjustment {
+  user_id: number;
+  wallet_id: number;
+  currency: string;
+  operation: string;
+  amount: number;
+  balance: number;
+  balance_delta: number;
+  reference?: string;
+}
+
+export interface S2SMessage {
+  id: number;
+  app_id: number;
+  title: string;
+  content: string;
+  type: string;
+  sender_id?: number | null;
+  sender_name?: string;
+  receiver_id: number;
+  is_read: boolean;
+  read_at?: string | null;
+  created_at: string;
+}
+
+export interface S2SProduct {
+  id: number;
+  code: string;
+  name: string;
+  description?: string | null;
+  effective_at?: string | null;
+  deprecated_at?: string | null;
+}
+
+export interface S2SOwnership {
+  has_ownership: boolean;
+  via: string[];
+}
+
+export class BasaltPassClient {
+  private readonly baseUrl: string;
+  private readonly clientId: string;
+  private readonly clientSecret: string;
+  private readonly defaultHeaders: Record<string, string>;
+  private readonly fetchImpl: typeof fetch;
 
   constructor(config: BasaltPassConfig) {
-    this.config = {
-      scopes: ['openid', 'profile', 'email'],
-      usePKCE: true,
-      enableSilentRenew: true,
-      silentRenewInterval: 300, // 5分钟
-      ...config
-    };
+    if (!config.clientId) throw new Error('clientId is required');
+    if (!config.clientSecret) throw new Error('clientSecret is required');
+    this.baseUrl = (config.baseUrl || 'http://localhost:8101').replace(/\/+$/, '');
+    this.clientId = config.clientId;
+    this.clientSecret = config.clientSecret;
+    this.defaultHeaders = config.defaultHeaders || {};
+    this.fetchImpl = config.fetchImpl || fetch;
   }
 
-  /**
-   * 初始化SDK
-   */
-  public async init(onAuth?: AuthCallback): Promise<void> {
-    this.onAuthCallback = onAuth;
-    
-    // 检查URL参数中的授权码
-    const urlParams = new URLSearchParams(window.location.search);
-    const code = urlParams.get('code');
-    const error = urlParams.get('error');
-
-    if (error) {
-      this.notifyAuth({ success: false, error });
-      return;
-    }
-
-    if (code) {
-      await this.handleAuthorizationCode(code);
-      return;
-    }
-
-    // 检查本地存储的令牌
-    const storedToken = localStorage.getItem('basaltpass_access_token');
-    if (storedToken) {
-      this.accessToken = storedToken;
-      await this.loadUserInfo();
-    }
-
-    // 启动静默刷新
-    if (this.config.enableSilentRenew && this.accessToken) {
-      this.startSilentRenew();
-    }
+  public health(): Promise<string> {
+    return this.request<{ status: string }>('GET', '/api/v1/s2s/health').then((data) => data.status);
   }
 
-  /**
-   * 登录
-   */
-  public async login(): Promise<void> {
-    const state = this.generateRandomString(32);
-    localStorage.setItem('oauth_state', state);
+  public me(): Promise<ClientContext> {
+    return this.request<ClientContext>('GET', '/api/v1/s2s/me');
+  }
 
-    let codeChallenge: string | undefined;
-    let codeVerifier: string | undefined;
+  public getUser(userId: number): Promise<S2SUser> {
+    return this.request<S2SUser>('GET', `/api/v1/s2s/users/${userId}`);
+  }
 
-    if (this.config.usePKCE) {
-      codeVerifier = this.generateRandomString(128);
-      codeChallenge = await this.generateCodeChallenge(codeVerifier);
-      localStorage.setItem('oauth_code_verifier', codeVerifier);
-    }
+  public async lookupUsers(params: { email?: string; phone?: string; q?: string; page?: number; pageSize?: number }): Promise<S2SUser[]> {
+    const data = await this.request<{ users?: S2SUser[] }>('GET', '/api/v1/s2s/users/lookup', this.query({
+      email: params.email,
+      phone: params.phone,
+      q: params.q,
+      page: params.page,
+      page_size: params.pageSize,
+    }));
+    return data.users || [];
+  }
 
-    const authUrl = new URL(this.config.authorizationEndpoint || '/oauth/authorize', window.location.origin);
-    const params = new URLSearchParams({
-      client_id: this.config.clientId,
-      redirect_uri: this.config.redirectUri || window.location.href,
-      response_type: 'code',
-      scope: this.config.scopes!.join(' '),
-      state
+  public updateUser(userId: number, body: { nickname: string }): Promise<S2SUser> {
+    return this.request<S2SUser>('PATCH', `/api/v1/s2s/users/${userId}`, undefined, body);
+  }
+
+  public async getUserRoles(userId: number, tenantId?: number): Promise<S2SRole[]> {
+    const data = await this.request<{ roles?: S2SRole[] }>('GET', `/api/v1/s2s/users/${userId}/roles`, this.query({ tenant_id: tenantId }));
+    return data.roles || [];
+  }
+
+  public getUserRoleCodes(userId: number, tenantId?: number): Promise<RoleCodes> {
+    return this.request<RoleCodes>('GET', `/api/v1/s2s/users/${userId}/role-codes`, this.query({ tenant_id: tenantId }));
+  }
+
+  public getUserPermissions(userId: number, tenantId?: number): Promise<RoleCodes> {
+    return this.request<RoleCodes>('GET', `/api/v1/s2s/users/${userId}/permissions`, this.query({ tenant_id: tenantId }));
+  }
+
+  public async listTeams(params: { userId?: number; q?: string; page?: number; pageSize?: number } = {}): Promise<S2STeam[]> {
+    const data = await this.request<{ teams?: S2STeam[] }>('GET', '/api/v1/s2s/teams', this.query({
+      user_id: params.userId,
+      q: params.q,
+      page: params.page,
+      page_size: params.pageSize,
+    }));
+    return data.teams || [];
+  }
+
+  public createTeam(body: CreateTeamRequest): Promise<S2STeam> {
+    return this.request<S2STeam>('POST', '/api/v1/s2s/teams', undefined, body);
+  }
+
+  public getTeam(teamId: number): Promise<S2STeam> {
+    return this.request<S2STeam>('GET', `/api/v1/s2s/teams/${teamId}`);
+  }
+
+  public async getUserTeams(userId: number): Promise<S2STeam[]> {
+    const data = await this.request<{ teams?: S2STeam[] }>('GET', `/api/v1/s2s/users/${userId}/teams`);
+    return data.teams || [];
+  }
+
+  public getUserWallet(userId: number, params: { currency: string; limit?: number; tenantId?: number }): Promise<S2SUserWallet> {
+    return this.request<S2SUserWallet>('GET', `/api/v1/s2s/users/${userId}/wallets`, this.query({
+      currency: params.currency,
+      limit: params.limit,
+      tenant_id: params.tenantId,
+    }));
+  }
+
+  public adjustUserWallet(userId: number, body: { operation: 'increase' | 'decrease'; amount: number; currency: string; reference?: string }): Promise<S2SWalletAdjustment> {
+    return this.request<S2SWalletAdjustment>('POST', `/api/v1/s2s/users/${userId}/wallets/adjust`, undefined, body);
+  }
+
+  public getUserMessages(userId: number, params: { status?: 'all' | 'unread'; page?: number; pageSize?: number; tenantId?: number } = {}): Promise<{ messages: S2SMessage[]; total: number; page: number; page_size: number }> {
+    return this.request('GET', `/api/v1/s2s/users/${userId}/messages`, this.query({
+      status: params.status,
+      page: params.page,
+      page_size: params.pageSize,
+      tenant_id: params.tenantId,
+    }));
+  }
+
+  public sendNotification(body: { title: string; content: string; type?: 'info' | 'success' | 'warning' | 'error'; user_ids?: number[]; sender_name?: string; broadcast?: boolean }): Promise<Record<string, unknown>> {
+    return this.request('POST', '/api/v1/s2s/notifications', undefined, body);
+  }
+
+  public async getUserProducts(userId: number): Promise<S2SProduct[]> {
+    const data = await this.request<{ products?: S2SProduct[] }>('GET', `/api/v1/s2s/users/${userId}/products`);
+    return data.products || [];
+  }
+
+  public checkUserProductOwnership(userId: number, productId: number): Promise<S2SOwnership> {
+    return this.request<S2SOwnership>('GET', `/api/v1/s2s/users/${userId}/products/${productId}/ownership`);
+  }
+
+  public sendEmail(body: { subject: string; text_body?: string; html_body?: string; user_ids?: number[]; reply_to?: string; broadcast?: boolean }): Promise<Record<string, unknown>> {
+    return this.request('POST', '/api/v1/s2s/emails/send', undefined, body);
+  }
+
+  private async request<T>(method: string, path: string, query?: URLSearchParams, body?: unknown): Promise<T> {
+    const url = new URL(`${this.baseUrl}${path}`);
+    if (query) url.search = query.toString();
+    const response = await this.fetchImpl(url.toString(), {
+      method,
+      headers: {
+        client_id: this.clientId,
+        client_secret: this.clientSecret,
+        Accept: 'application/json',
+        ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+        ...this.defaultHeaders,
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
     });
-
-    if (codeChallenge) {
-      params.append('code_challenge', codeChallenge);
-      params.append('code_challenge_method', 'S256');
-    }
-
-    authUrl.search = params.toString();
-    window.location.href = authUrl.toString();
-  }
-
-  /**
-   * One-Tap 登录
-   */
-  public async oneTapLogin(): Promise<AuthResult> {
-    try {
-      const response = await fetch('/oauth/one-tap/login', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': this.accessToken ? `Bearer ${this.accessToken}` : ''
-        },
-        body: JSON.stringify({
-          client_id: this.config.clientId,
-          nonce: this.generateRandomString(32),
-          response_type: 'id_token'
-        })
-      });
-
-      if (response.ok) {
-        const result = await response.json();
-        if (result.success && result.id_token) {
-          // 解析ID Token获取用户信息
-          const payload = this.parseJWT(result.id_token);
-          this.userInfo = {
-            sub: payload.sub,
-            email: payload.email,
-            email_verified: payload.email_verified,
-            name: payload.name,
-            nickname: payload.nickname,
-            picture: payload.picture,
-            preferred_username: payload.preferred_username
-          };
-
-          return {
-            success: true,
-            user: this.userInfo,
-            accessToken: this.accessToken
-          };
-        } else {
-          return {
-            success: false,
-            error: result.error || 'One-Tap login failed'
-          };
-        }
-      } else {
-        const error = await response.json();
-        return {
-          success: false,
-          error: error.error_description || error.error || 'One-Tap login failed'
-        };
-      }
-    } catch (error) {
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : 'Network error'
-      };
-    }
-  }
-
-  /**
-   * 静默认证
-   */
-  public async silentAuth(): Promise<AuthResult> {
-    try {
-      // 创建隐藏的iframe进行静默认证
-      const iframe = document.createElement('iframe');
-      iframe.style.display = 'none';
-      iframe.style.width = '0';
-      iframe.style.height = '0';
-      
-      const state = this.generateRandomString(32);
-      const nonce = this.generateRandomString(32);
-
-      const authUrl = new URL('/oauth/silent-auth', window.location.origin);
-      const params = new URLSearchParams({
-        client_id: this.config.clientId,
-        redirect_uri: window.location.origin,
-        response_type: 'id_token',
-        scope: this.config.scopes!.join(' '),
-        prompt: 'none',
-        state,
-        nonce
-      });
-
-      authUrl.search = params.toString();
-      iframe.src = authUrl.toString();
-
-      document.body.appendChild(iframe);
-
-      // 监听iframe的消息
-      return new Promise<AuthResult>((resolve) => {
-        const timeout = setTimeout(() => {
-          cleanup();
-          resolve({
-            success: false,
-            error: 'Silent auth timeout'
-          });
-        }, 10000); // 10秒超时
-
-        const messageHandler = (event: MessageEvent) => {
-          if (event.origin !== window.location.origin) {
-            return;
-          }
-
-          if (event.data && typeof event.data === 'object') {
-            cleanup();
-            
-            if (event.data.success && event.data.id_token) {
-              // 解析ID Token
-              const payload = this.parseJWT(event.data.id_token);
-              this.userInfo = {
-                sub: payload.sub,
-                email: payload.email,
-                email_verified: payload.email_verified,
-                name: payload.name,
-                nickname: payload.nickname,
-                picture: payload.picture,
-                preferred_username: payload.preferred_username
-              };
-
-              resolve({
-                success: true,
-                user: this.userInfo,
-                accessToken: this.accessToken
-              });
-            } else {
-              resolve({
-                success: false,
-                error: event.data.error || 'Silent auth failed'
-              });
-            }
-          }
-        };
-
-        const cleanup = () => {
-          clearTimeout(timeout);
-          window.removeEventListener('message', messageHandler);
-          if (iframe.parentNode) {
-            iframe.parentNode.removeChild(iframe);
-          }
-        };
-
-        window.addEventListener('message', messageHandler);
-      });
-    } catch (error) {
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : 'Silent auth error'
-      };
-    }
-  }
-
-  /**
-   * 退出登录
-   */
-  public logout(): void {
-    this.accessToken = undefined;
-    this.userInfo = undefined;
-    
-    localStorage.removeItem('basaltpass_access_token');
-    localStorage.removeItem('basaltpass_user_info');
-    
-    // 调用后端注销接口以清除Cookie（可选）
-    // fetch('/auth/logout', { method: 'POST' });
-
-    this.stopSilentRenew();
-    this.notifyAuth({ success: false });
-  }
-
-  /**
-   * 获取当前用户信息
-   */
-  public getUser(): UserInfo | undefined {
-    return this.userInfo;
-  }
-
-  /**
-   * 获取访问令牌
-   */
-  public getAccessToken(): string | undefined {
-    return this.accessToken;
-  }
-
-  /**
-   * 检查是否已认证
-   */
-  public isAuthenticated(): boolean {
-    return !!this.accessToken && !!this.userInfo;
-  }
-
-  /**
-   * 刷新令牌
-   * 使用 HttpOnly Cookie 进行刷新，不依赖 localStorage 中的 refresh_token
-   */
-  public async refreshAccessToken(): Promise<boolean> {
-    try {
-      // 优先使用专门的 Refresh Endpoint，通常是 /auth/refresh，支持通过 Cookie 验证
-      // 如果配置了 tokenEndpoint (如 /oauth/token)，则尝试使用它，但依然依赖 Cookie 而非 Body 参数
-      const endpoint = '/auth/refresh'; 
-
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Accept': 'application/json'
-        },
-        credentials: 'include' // 关键：发送 Cookie
-      });
-
-      if (response.ok) {
-        // Refresh 接口通常只返回新的 access_token (和潜在的新 refresh cookie)
-        // 或者是标准的 TokenResponse
-        const data = await response.json();
-        
-        // 兼容处理：data可能是 { access_token: "..." } 或 TokenResponse
-        const newAccessToken = data.access_token;
-        
-        if (newAccessToken) {
-          // 更新 access_token
-          this.accessToken = newAccessToken;
-          localStorage.setItem('basaltpass_access_token', this.accessToken!);
-          
-          // 加载最新的用户信息
-          await this.loadUserInfo();
-          
-          return true;
-        }
-      }
-    } catch (error) {
-      console.error('Token refresh failed:', error);
-    }
-
-    return false;
-  }
-
-  /**
-   * 处理授权码
-   */
-  private async handleAuthorizationCode(code: string): Promise<void> {
-    const state = new URLSearchParams(window.location.search).get('state');
-    const storedState = localStorage.getItem('oauth_state');
-    
-    if (state !== storedState) {
-      this.notifyAuth({ success: false, error: 'Invalid state parameter' });
-      return;
-    }
-
-    try {
-      const body = new URLSearchParams({
-        grant_type: 'authorization_code',
-        code,
-        redirect_uri: this.config.redirectUri || window.location.href,
-        client_id: this.config.clientId
-      });
-
-      const codeVerifier = localStorage.getItem('oauth_code_verifier');
-      if (codeVerifier) {
-        body.append('code_verifier', codeVerifier);
-      }
-
-      const response = await fetch(this.config.tokenEndpoint || '/oauth/token', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body
-      });
-
-      if (response.ok) {
-        const tokenData: TokenResponse = await response.json();
-        await this.handleTokenResponse(tokenData);
-        
-        // 清理URL和存储
-        window.history.replaceState({}, document.title, window.location.pathname);
-        localStorage.removeItem('oauth_state');
-        localStorage.removeItem('oauth_code_verifier');
-        
-        this.notifyAuth({ 
-          success: true, 
-          user: this.userInfo, 
-          accessToken: this.accessToken 
-        });
-      } else {
-        const error = await response.json();
-        this.notifyAuth({ 
-          success: false, 
-          error: error.error_description || error.error 
-        });
-      }
-    } catch (error) {
-      this.notifyAuth({ 
-        success: false, 
-        error: error instanceof Error ? error.message : 'Unknown error' 
+    const envelope = (await response.json()) as Envelope<T>;
+    if (!response.ok || envelope.error) {
+      throw new BasaltPassApiError(envelope.error?.message || response.statusText, {
+        status: response.status,
+        code: envelope.error?.code,
+        requestId: envelope.request_id,
       });
     }
+    return envelope.data;
   }
 
-  /**
-   * 处理令牌响应
-   */
-  private async handleTokenResponse(tokenData: TokenResponse): Promise<void> {
-    this.accessToken = tokenData.access_token;
-    // 安全修复：不要在 localStorage 中存储 refresh_token
-    // this.refreshToken = tokenData.refresh_token; 
-    // 后端应通过 Set-Cookie 头设置 refresh_token HttpOnly Cookie
-    
-    localStorage.setItem('basaltpass_access_token', this.accessToken);
-    // localStorage.removeItem('basaltpass_refresh_token'); // 确保清除旧的
-
-    await this.loadUserInfo();
-    
-    if (this.config.enableSilentRenew) {
-      this.startSilentRenew();
-    }
-  }
-
-  /**
-   * 加载用户信息
-   * 增强：当 Access Token 过期 (401) 时自动尝试刷新
-   */
-  private async loadUserInfo(): Promise<void> {
-    if (!this.accessToken) return;
-
-    try {
-      const response = await fetch(this.config.userInfoEndpoint || '/oauth/userinfo', {
-        headers: {
-          'Authorization': `Bearer ${this.accessToken}`
-        }
-      });
-
-      if (response.ok) {
-        this.userInfo = await response.json();
-        localStorage.setItem('basaltpass_user_info', JSON.stringify(this.userInfo));
-      } else if (response.status === 401) {
-        // 令牌可能已过期，尝试使用 Cookie 刷新
-        console.log('Access token expired, attempting silent refresh...');
-        const refreshed = await this.refreshAccessToken();
-        if (!refreshed) {
-          this.logout();
-        }
-        // 如果刷新成功，refreshAccessToken 会递归调用 loadUserInfo 并成功，这里不需要额外操作
-      } else {
-        // 其他错误，注销
-        this.logout();
-      }
-    } catch (error) {
-      console.error('Failed to load user info:', error);
-    }
-  }
-
-  /**
-   * 启动静默刷新
-   */
-  private startSilentRenew(): void {
-    this.stopSilentRenew();
-    
-    this.silentRenewTimer = window.setInterval(async () => {
-      const refreshed = await this.refreshAccessToken();
-      if (!refreshed) {
-        this.logout();
-      }
-    }, this.config.silentRenewInterval! * 1000);
-  }
-
-  /**
-   * 停止静默刷新
-   */
-  private stopSilentRenew(): void {
-    if (this.silentRenewTimer) {
-      clearInterval(this.silentRenewTimer);
-      this.silentRenewTimer = undefined;
-    }
-  }
-
-  /**
-   * 通知认证状态变化
-   */
-  private notifyAuth(result: AuthResult): void {
-    if (this.onAuthCallback) {
-      this.onAuthCallback(result);
-    }
-  }
-
-  /**
-   * 生成随机字符串
-   */
-  private generateRandomString(length: number): string {
-    const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
-    let result = '';
-    for (let i = 0; i < length; i++) {
-      result += characters.charAt(Math.floor(Math.random() * characters.length));
-    }
-    return result;
-  }
-
-  /**
-   * 生成PKCE代码挑战
-   */
-  private async generateCodeChallenge(verifier: string): Promise<string> {
-    const encoder = new TextEncoder();
-    const data = encoder.encode(verifier);
-    const digest = await crypto.subtle.digest('SHA-256', data);
-    const base64String = btoa(String.fromCharCode(...new Uint8Array(digest)));
-    return base64String.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
-  }
-
-  /**
-   * 解析JWT令牌（仅解析payload，不验证签名）
-   */
-  private parseJWT(token: string): any {
-    try {
-      const parts = token.split('.');
-      if (parts.length !== 3) {
-        throw new Error('Invalid JWT format');
-      }
-      
-      const payload = parts[1];
-      // 添加base64填充
-      const paddedPayload = payload + '='.repeat((4 - payload.length % 4) % 4);
-      const decoded = atob(paddedPayload.replace(/-/g, '+').replace(/_/g, '/'));
-      return JSON.parse(decoded);
-    } catch (error) {
-      throw new Error('Failed to parse JWT: ' + (error instanceof Error ? error.message : 'Unknown error'));
-    }
+  private query(values: Record<string, string | number | boolean | undefined>): URLSearchParams {
+    const params = new URLSearchParams();
+    Object.entries(values).forEach(([key, value]) => {
+      if (value !== undefined && value !== null) params.set(key, String(value));
+    });
+    return params;
   }
 }
 
-/**
- * 全局初始化函数
- */
-export function initBasaltPass(config: BasaltPassConfig, onAuth?: AuthCallback): BasaltPass {
-  const instance = new BasaltPass(config);
-  instance.init(onAuth);
-  return instance;
+export function createBasaltPassClient(config: BasaltPassConfig): BasaltPassClient {
+  return new BasaltPassClient(config);
 }
 
-// 默认导出
-export default BasaltPass;
+export default BasaltPassClient;

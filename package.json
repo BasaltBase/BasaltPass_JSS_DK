@@ -1,7 +1,7 @@
 {
   "name": "@basaltpass/sdk",
-  "version": "1.0.0",
-  "description": "BasaltPass OAuth2/OIDC JavaScript SDK with One-Tap Auth support",
+  "version": "1.1.0",
+  "description": "BasaltPass S2S JavaScript SDK",
   "main": "dist/basaltpass.js",
   "module": "dist/basaltpass.esm.js",
   "types": "dist/basaltpass.d.ts",
@@ -16,11 +16,10 @@
     "type-check": "tsc --noEmit"
   },
   "keywords": [
-    "oauth2",
-    "oidc",
-    "authentication",
+    "s2s",
+    "server-to-server",
+    "api-client",
     "basaltpass",
-    "one-tap",
     "sdk"
   ],
   "author": "BasaltPass Team",
