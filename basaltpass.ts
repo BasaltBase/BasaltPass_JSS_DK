@@ -285,4 +285,385 @@ export function createBasaltPassClient(config: BasaltPassConfig): BasaltPassClie
   return new BasaltPassClient(config);
 }
 
+export interface BasaltPassAuthConfig {
+  apiBaseUrl?: string;
+  clientId: string;
+  clientSecret?: string;
+  redirectUri?: string;
+  authorizationEndpoint?: string;
+  tokenEndpoint?: string;
+  userInfoEndpoint?: string;
+  oneTapEndpoint?: string;
+  silentAuthEndpoint?: string;
+  scopes?: string[];
+  usePKCE?: boolean;
+  enableSilentRenew?: boolean;
+  silentRenewInterval?: number;
+  fetchImpl?: typeof fetch;
+}
+
+export interface BasaltPassUserInfo {
+  sub: string;
+  email?: string;
+  email_verified?: boolean;
+  name?: string;
+  nickname?: string;
+  picture?: string;
+  preferred_username?: string;
+}
+
+export interface BasaltPassTokenResponse {
+  access_token: string;
+  token_type: string;
+  expires_in: number;
+  refresh_token?: string;
+  scope?: string;
+  id_token?: string;
+}
+
+export interface BasaltPassAuthResult {
+  success: boolean;
+  user?: BasaltPassUserInfo;
+  accessToken?: string;
+  idToken?: string;
+  error?: string;
+}
+
+export type BasaltPassAuthCallback = (result: BasaltPassAuthResult) => void;
+
+export class BasaltPassAuth {
+  private readonly config: Required<Pick<BasaltPassAuthConfig, 'scopes' | 'usePKCE' | 'enableSilentRenew' | 'silentRenewInterval'>> & BasaltPassAuthConfig;
+  private readonly fetchImpl: typeof fetch;
+  private accessToken?: string;
+  private idToken?: string;
+  private userInfo?: BasaltPassUserInfo;
+  private silentRenewTimer?: ReturnType<typeof setInterval>;
+  private onAuthCallback?: BasaltPassAuthCallback;
+
+  constructor(config: BasaltPassAuthConfig) {
+    if (!config.clientId) throw new Error('clientId is required');
+    this.config = {
+      scopes: ['openid', 'profile', 'email'],
+      usePKCE: true,
+      enableSilentRenew: true,
+      silentRenewInterval: 300,
+      ...config,
+    };
+    this.fetchImpl = config.fetchImpl || fetch;
+  }
+
+  public async init(onAuth?: BasaltPassAuthCallback): Promise<void> {
+    this.onAuthCallback = onAuth;
+    if (typeof window === 'undefined') return;
+
+    const params = new URLSearchParams(window.location.search);
+    const error = params.get('error');
+    const code = params.get('code');
+    if (error) {
+      this.notifyAuth({ success: false, error });
+      return;
+    }
+    if (code) {
+      await this.handleAuthorizationCode(code);
+      return;
+    }
+
+    const storedToken = window.localStorage.getItem('basaltpass_access_token');
+    const storedIDToken = window.localStorage.getItem('basaltpass_id_token');
+    if (storedToken) {
+      this.accessToken = storedToken;
+      this.idToken = storedIDToken || undefined;
+      await this.loadUserInfo();
+      if (this.config.enableSilentRenew && this.accessToken) this.startSilentRenew();
+    }
+  }
+
+  public async login(): Promise<void> {
+    if (typeof window === 'undefined') throw new Error('login requires a browser environment');
+    const state = this.randomString(32);
+    const nonce = this.randomString(32);
+    window.sessionStorage.setItem('basaltpass_oauth_state', state);
+    window.sessionStorage.setItem('basaltpass_oauth_nonce', nonce);
+
+    const params = new URLSearchParams({
+      client_id: this.config.clientId,
+      redirect_uri: this.redirectUri(),
+      response_type: 'code',
+      scope: this.config.scopes.join(' '),
+      state,
+      nonce,
+    });
+    if (this.config.usePKCE) {
+      const verifier = this.randomString(96);
+      const challenge = await this.codeChallenge(verifier);
+      window.sessionStorage.setItem('basaltpass_oauth_code_verifier', verifier);
+      params.set('code_challenge', challenge);
+      params.set('code_challenge_method', 'S256');
+    }
+
+    const authUrl = new URL(this.endpoint('/api/v1/oauth/authorize', this.config.authorizationEndpoint));
+    authUrl.search = params.toString();
+    window.location.href = authUrl.toString();
+  }
+
+  public async oneTapLogin(): Promise<BasaltPassAuthResult> {
+    const state = this.randomString(32);
+    const nonce = this.randomString(32);
+    const pkce = this.config.usePKCE ? await this.pkcePair() : undefined;
+    const body: Record<string, string> = {
+      client_id: this.config.clientId,
+      redirect_uri: this.redirectUri(),
+      response_type: 'code',
+      scope: this.config.scopes.join(' '),
+      state,
+      nonce,
+    };
+    if (pkce) {
+      body.code_challenge = pkce.challenge;
+      body.code_challenge_method = 'S256';
+    }
+
+    const response = await this.fetchImpl(this.endpoint('/api/v1/oauth/one-tap/login', this.config.oneTapEndpoint), {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        ...(this.accessToken ? { Authorization: `Bearer ${this.accessToken}` } : {}),
+      },
+      credentials: 'include',
+      body: JSON.stringify(body),
+    });
+    const result = await response.json() as { success?: boolean; code?: string; error?: string; error_description?: string; state?: string };
+    if (!response.ok || !result.success || !result.code) {
+      return { success: false, error: result.error_description || result.error || response.statusText };
+    }
+    if (result.state !== state) return { success: false, error: 'Invalid state parameter' };
+    return this.exchangeAndLoad(result.code, pkce?.verifier);
+  }
+
+  public async silentAuth(): Promise<BasaltPassAuthResult> {
+    if (typeof window === 'undefined' || typeof document === 'undefined') {
+      return { success: false, error: 'silentAuth requires a browser environment' };
+    }
+
+    const state = this.randomString(32);
+    const nonce = this.randomString(32);
+    const pkce = this.config.usePKCE ? await this.pkcePair() : undefined;
+    const authUrl = new URL(this.endpoint('/api/v1/oauth/silent-auth', this.config.silentAuthEndpoint));
+    authUrl.search = new URLSearchParams({
+      client_id: this.config.clientId,
+      redirect_uri: this.redirectUri(),
+      prompt: 'none',
+      scope: this.config.scopes.join(' '),
+      state,
+      nonce,
+      ...(pkce ? { code_challenge: pkce.challenge, code_challenge_method: 'S256' } : {}),
+    }).toString();
+
+    const iframe = document.createElement('iframe');
+    iframe.style.display = 'none';
+    iframe.style.width = '0';
+    iframe.style.height = '0';
+    iframe.src = authUrl.toString();
+    document.body.appendChild(iframe);
+
+    return new Promise<BasaltPassAuthResult>((resolve) => {
+      const timeout = setTimeout(() => {
+        cleanup();
+        resolve({ success: false, error: 'Silent auth timeout' });
+      }, 10000);
+      const expectedOrigin = authUrl.origin;
+      const handler = async (event: MessageEvent) => {
+        if (event.origin !== expectedOrigin) return;
+        if (!event.data || typeof event.data !== 'object') return;
+        cleanup();
+        if (!event.data.success || !event.data.code) {
+          resolve({ success: false, error: event.data.error || 'Silent auth failed' });
+          return;
+        }
+        if (event.data.state !== state) {
+          resolve({ success: false, error: 'Invalid state parameter' });
+          return;
+        }
+        resolve(await this.exchangeAndLoad(event.data.code, pkce?.verifier));
+      };
+      const cleanup = () => {
+        clearTimeout(timeout);
+        window.removeEventListener('message', handler);
+        iframe.remove();
+      };
+      window.addEventListener('message', handler);
+    });
+  }
+
+  public logout(): void {
+    this.accessToken = undefined;
+    this.idToken = undefined;
+    this.userInfo = undefined;
+    if (typeof window !== 'undefined') {
+      window.localStorage.removeItem('basaltpass_access_token');
+      window.localStorage.removeItem('basaltpass_id_token');
+      window.localStorage.removeItem('basaltpass_user_info');
+    }
+    this.stopSilentRenew();
+    this.notifyAuth({ success: false });
+  }
+
+  public getUser(): BasaltPassUserInfo | undefined {
+    return this.userInfo;
+  }
+
+  public getAccessToken(): string | undefined {
+    return this.accessToken;
+  }
+
+  public getIDToken(): string | undefined {
+    return this.idToken;
+  }
+
+  public isAuthenticated(): boolean {
+    return !!this.accessToken && !!this.userInfo;
+  }
+
+  public async refreshAccessToken(): Promise<boolean> {
+    if (!this.accessToken) return false;
+    const result = await this.silentAuth();
+    return result.success;
+  }
+
+  private async handleAuthorizationCode(code: string): Promise<void> {
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    const state = params.get('state') || '';
+    const storedState = window.sessionStorage.getItem('basaltpass_oauth_state') || '';
+    if (state !== storedState) {
+      this.notifyAuth({ success: false, error: 'Invalid state parameter' });
+      return;
+    }
+    const verifier = window.sessionStorage.getItem('basaltpass_oauth_code_verifier') || undefined;
+    const result = await this.exchangeAndLoad(code, verifier);
+    window.history.replaceState({}, document.title, window.location.pathname + window.location.hash);
+    window.sessionStorage.removeItem('basaltpass_oauth_state');
+    window.sessionStorage.removeItem('basaltpass_oauth_nonce');
+    window.sessionStorage.removeItem('basaltpass_oauth_code_verifier');
+    this.notifyAuth(result);
+  }
+
+  private async exchangeAndLoad(code: string, codeVerifier?: string): Promise<BasaltPassAuthResult> {
+    try {
+      const token = await this.exchangeCode(code, codeVerifier);
+      await this.handleTokenResponse(token);
+      const result = { success: true, user: this.userInfo, accessToken: this.accessToken, idToken: this.idToken };
+      this.notifyAuth(result);
+      return result;
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Token exchange failed' };
+    }
+  }
+
+  private async exchangeCode(code: string, codeVerifier?: string): Promise<BasaltPassTokenResponse> {
+    const body = new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: this.redirectUri(),
+      client_id: this.config.clientId,
+    });
+    if (codeVerifier) body.set('code_verifier', codeVerifier);
+    if (this.config.clientSecret) body.set('client_secret', this.config.clientSecret);
+
+    const response = await this.fetchImpl(this.endpoint('/api/v1/oauth/token', this.config.tokenEndpoint), {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
+      credentials: 'include',
+      body,
+    });
+    const payload = await response.json() as BasaltPassTokenResponse & { error?: string; error_description?: string };
+    if (!response.ok) throw new Error(payload.error_description || payload.error || response.statusText);
+    return payload;
+  }
+
+  private async handleTokenResponse(token: BasaltPassTokenResponse): Promise<void> {
+    this.accessToken = token.access_token;
+    this.idToken = token.id_token;
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem('basaltpass_access_token', token.access_token);
+      if (token.id_token) window.localStorage.setItem('basaltpass_id_token', token.id_token);
+    }
+    await this.loadUserInfo();
+    if (this.config.enableSilentRenew) this.startSilentRenew();
+  }
+
+  private async loadUserInfo(): Promise<void> {
+    if (!this.accessToken) return;
+    const response = await this.fetchImpl(this.endpoint('/api/v1/oauth/userinfo', this.config.userInfoEndpoint), {
+      headers: { Accept: 'application/json', Authorization: `Bearer ${this.accessToken}` },
+      credentials: 'include',
+    });
+    if (!response.ok) throw new Error(response.statusText || 'Failed to load user info');
+    this.userInfo = await response.json() as BasaltPassUserInfo;
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem('basaltpass_user_info', JSON.stringify(this.userInfo));
+    }
+  }
+
+  private startSilentRenew(): void {
+    this.stopSilentRenew();
+    this.silentRenewTimer = setInterval(() => {
+      void this.silentAuth().then((result) => {
+        if (!result.success) this.logout();
+      });
+    }, this.config.silentRenewInterval * 1000);
+  }
+
+  private stopSilentRenew(): void {
+    if (this.silentRenewTimer) clearInterval(this.silentRenewTimer);
+    this.silentRenewTimer = undefined;
+  }
+
+  private notifyAuth(result: BasaltPassAuthResult): void {
+    if (this.onAuthCallback) this.onAuthCallback(result);
+  }
+
+  private redirectUri(): string {
+    if (this.config.redirectUri) return this.config.redirectUri;
+    if (typeof window !== 'undefined') return window.location.href.split('#')[0].split('?')[0];
+    throw new Error('redirectUri is required outside a browser environment');
+  }
+
+  private endpoint(defaultPath: string, override?: string): string {
+    const raw = override || defaultPath;
+    if (/^https?:\/\//i.test(raw)) return raw;
+    const base = (this.config.apiBaseUrl || (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8101')).replace(/\/+$/, '');
+    return `${base}${raw.startsWith('/') ? raw : `/${raw}`}`;
+  }
+
+  private async pkcePair(): Promise<{ verifier: string; challenge: string }> {
+    const verifier = this.randomString(96);
+    return { verifier, challenge: await this.codeChallenge(verifier) };
+  }
+
+  private randomString(length: number): string {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
+    const values = new Uint8Array(length);
+    if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+      crypto.getRandomValues(values);
+      return Array.from(values, (value) => chars[value % chars.length]).join('');
+    }
+    return Array.from({ length }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+  }
+
+  private async codeChallenge(verifier: string): Promise<string> {
+    const data = new TextEncoder().encode(verifier);
+    const digest = await crypto.subtle.digest('SHA-256', data);
+    const binary = String.fromCharCode(...new Uint8Array(digest));
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+  }
+}
+
+export function initBasaltPass(config: BasaltPassAuthConfig, onAuth?: BasaltPassAuthCallback): BasaltPassAuth {
+  const instance = new BasaltPassAuth(config);
+  void instance.init(onAuth);
+  return instance;
+}
+
 export default BasaltPassClient;

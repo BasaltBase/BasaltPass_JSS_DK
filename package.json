@@ -1,7 +1,7 @@
 {
   "name": "@basaltpass/sdk",
   "version": "1.1.0",
-  "description": "BasaltPass S2S JavaScript SDK",
+  "description": "BasaltPass JavaScript SDK for S2S APIs and browser OAuth/OIDC auth",
   "main": "dist/basaltpass.js",
   "module": "dist/basaltpass.esm.js",
   "types": "dist/basaltpass.d.ts",
@@ -19,6 +19,9 @@
     "s2s",
     "server-to-server",
     "api-client",
+    "oauth",
+    "oidc",
+    "one-tap",
     "basaltpass",
     "sdk"
   ],

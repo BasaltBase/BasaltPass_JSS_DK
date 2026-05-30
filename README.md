@@ -1,16 +1,41 @@
 # BasaltPass JavaScript SDK
 
-BasaltPass S2S API client for TypeScript and JavaScript.
+TypeScript/JavaScript SDK for BasaltPass.
 
-Do not use this SDK directly in browser code with real credentials. `clientSecret` belongs on a trusted backend.
+This package exports two clients:
 
-## Installation
+- `BasaltPassClient`: trusted server-side S2S API client.
+- `BasaltPassAuth`: browser OAuth/OIDC client with One-Tap and Silent Auth.
 
-```bash
-npm install @basaltpass/sdk
+Do not put a real `clientSecret` in browser code. Browser apps should use a
+public OAuth client with `token_endpoint_auth_method=none` and PKCE.
+
+## Browser Auth Usage
+
+```typescript
+import { initBasaltPass } from '@basaltpass/sdk';
+
+const auth = initBasaltPass({
+  apiBaseUrl: 'https://auth.example.com',
+  clientId: 'public-client-id',
+  redirectUri: window.location.origin + '/callback',
+  scopes: ['openid', 'profile', 'email'],
+});
+
+const result = await auth.oneTapLogin();
+if (result.success) {
+  console.log(result.user);
+}
 ```
 
-## Usage
+One-Tap and Silent Auth use the hardened BasaltPass flow:
+
+1. Request an OAuth authorization code from `/api/v1/oauth/one-tap/login` or
+   `/api/v1/oauth/silent-auth?prompt=none`.
+2. Exchange the code at `/api/v1/oauth/token`.
+3. Load profile data from `/api/v1/oauth/userinfo`.
+
+## S2S Usage
 
 ```typescript
 import { BasaltPassClient } from '@basaltpass/sdk';
@@ -23,23 +48,10 @@ const client = new BasaltPassClient({
 
 const user = await client.getUser(123);
 console.log(user.email);
-
-const wallet = await client.getUserWallet(123, { currency: 'CNY', limit: 10 });
-console.log(wallet.balance);
 ```
 
-The client authenticates with `client_id` and `client_secret` headers and targets `/api/v1/s2s`.
-
-## Supported APIs
-
-- health and client context
-- user read, lookup, and update
-- roles, role codes, and permissions
-- teams
-- wallets
-- messages and notifications
-- products and ownership checks
-- email sending
+The S2S client authenticates with `client_id` and `client_secret` headers and
+targets `/api/v1/s2s`.
 
 ## Development
 
